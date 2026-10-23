@@ -1,0 +1,87 @@
+name: Assemble verified Windows installer
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  assemble:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: dmmhm/writely-releases
+    steps:
+      - name: Download parts and verify installer
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import concurrent.futures, hashlib, json, os, pathlib, urllib.request
+          token = os.environ['GH_TOKEN']
+          base = 'https://api.github.com/repos/dmmhm/writely-releases'
+          release_id = 421823440
+          expected = '5769485bf840ac742f9fb1aa90caa7ff443b064d42dd2755e4a725a742c7f0da'
+          def api(path):
+              request = urllib.request.Request(base + path, headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return json.load(response)
+          assets = api(f'/releases/{release_id}/assets?per_page=100')
+          parts = sorted((a for a in assets if a['name'].startswith('upload-part-')), key=lambda a: a['name'])
+          assert len(parts) == 25
+          assert [a['name'] for a in parts] == [f'upload-part-{i:03d}' for i in range(25)]
+          class SafeRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, fp, code, msg, headers, newurl):
+                  redirected = super().redirect_request(request, fp, code, msg, headers, newurl)
+                  redirected.remove_header('Authorization')
+                  return redirected
+          opener = urllib.request.build_opener(SafeRedirect())
+          pathlib.Path('parts').mkdir()
+          def download(asset):
+              request = urllib.request.Request(asset['url'], headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/octet-stream'})
+              path = pathlib.Path('parts') / asset['name']
+              with opener.open(request, timeout=120) as response, path.open('wb') as target:
+                  while chunk := response.read(4 * 1024 * 1024):
+                      target.write(chunk)
+              with path.open('rb') as source:
+                  assert 'sha256:' + hashlib.file_digest(source, 'sha256').hexdigest() == asset['digest']
+              assert path.stat().st_size == asset['size']
+              return path
+          with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+              list(executor.map(download, parts))
+          output = pathlib.Path('Writely_0.2.1_windows-x64-setup.exe')
+          with output.open('wb') as target:
+              for asset in parts:
+                  with (pathlib.Path('parts') / asset['name']).open('rb') as source:
+                      while chunk := source.read(4 * 1024 * 1024):
+                          target.write(chunk)
+          assert output.stat().st_size == 821658190
+          with output.open('rb') as source:
+              assert hashlib.file_digest(source, 'sha256').hexdigest() == expected
+          print('All 25 parts and the assembled installer passed SHA-256 verification.')
+          PY
+      - name: Upload complete installer
+        run: gh release upload v0.2.1 Writely_0.2.1_windows-x64-setup.exe
+      - name: Verify release, remove temporary parts, and publish
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          base = 'https://api.github.com/repos/dmmhm/writely-releases'
+          def api(path, method='GET', value=None):
+              request = urllib.request.Request(base + path, method=method, data=None if value is None else json.dumps(value).encode(), headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  data = response.read()
+                  return json.loads(data) if data else None
+          assets = api('/releases/421823440/assets?per_page=100')
+          installer = next(a for a in assets if a['name'] == 'Writely_0.2.1_windows-x64-setup.exe')
+          assert installer['state'] == 'uploaded' and installer['size'] == 821658190
+          assert installer['digest'] == 'sha256:5769485bf840ac742f9fb1aa90caa7ff443b064d42dd2755e4a725a742c7f0da'
+          assert {'SHA256SUMS', 'WINDOWS_TEST.txt', 'Writely_0.2.1_windows-x64-setup.exe.sig'}.issubset({a['name'] for a in assets})
+          for asset in assets:
+              if asset['name'].startswith('upload-part-'):
+                  api('/releases/assets/' + str(asset['id']), 'DELETE')
+          remaining = api('/releases/421823440/assets?per_page=100')
+          assert len(remaining) == 4 and all(a['state'] == 'uploaded' for a in remaining)
+          result = api('/releases/421823440', 'PATCH', {'draft': False, 'prerelease': True})
+          assert result['draft'] is False
+          print('Published:', result['html_url'])
+          PY
