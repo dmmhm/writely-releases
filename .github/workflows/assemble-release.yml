@@ -1,0 +1,119 @@
+name: Assemble signed Writely release
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        required: true
+        type: string
+      plan_sha256:
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  assemble:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_ID: ${{ inputs.release_id }}
+      PLAN_SHA: ${{ inputs.plan_sha256 }}
+    steps:
+      - name: Assemble verified packages and prepare the update feed
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import concurrent.futures, datetime, hashlib, json, os, pathlib, re, subprocess, urllib.request
+          repo = os.environ['GH_REPO']
+          assert repo == 'dmmhm/writely-releases'
+          release_id = int(os.environ['RELEASE_ID'])
+          expected_plan = os.environ['PLAN_SHA']
+          assert release_id > 0 and re.fullmatch(r'[0-9a-f]{64}', expected_plan)
+          base = f'https://api.github.com/repos/{repo}'
+          token = os.environ['GH_TOKEN']
+          def api(path, method='GET'):
+              request = urllib.request.Request(base + path, method=method, headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(request, timeout=90) as response:
+                  data = response.read()
+                  return json.loads(data) if data else None
+          class SafeRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, fp, code, msg, headers, newurl):
+                  redirected = super().redirect_request(request, fp, code, msg, headers, newurl)
+                  redirected.remove_header('Authorization')
+                  return redirected
+          opener = urllib.request.build_opener(SafeRedirect())
+          def read_asset(asset, maximum):
+              request = urllib.request.Request(asset['url'], headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/octet-stream'})
+              with opener.open(request, timeout=120) as response:
+                  data = response.read(maximum + 1)
+              assert len(data) <= maximum and len(data) == asset['size']
+              assert 'sha256:' + hashlib.sha256(data).hexdigest() == asset['digest']
+              return data
+          release = api(f'/releases/{release_id}')
+          assert release['draft']
+          assets = api(f'/releases/{release_id}/assets?per_page=100')
+          plan_asset = next(a for a in assets if a['name'] == 'release-plan.json')
+          plan_raw = read_asset(plan_asset, 65536)
+          assert hashlib.sha256(plan_raw).hexdigest() == expected_plan
+          plan = json.loads(plan_raw)
+          version = plan['version']
+          assert re.fullmatch(r'\d+\.\d+\.\d+', version) and release['tag_name'] == 'v' + version
+          assert set(plan['packages']) == {'windows-x64', 'macos-arm64'}
+          by_name = {a['name']: a for a in assets}
+          pathlib.Path('parts').mkdir()
+          all_parts = []
+          for platform, item in plan['packages'].items():
+              expected_name = f'Writely_{version}_windows-x64-setup.exe' if platform == 'windows-x64' else f'Writely_{version}_macos-arm64.app.tar.gz'
+              assert item['name'] == expected_name and 0 < item['size'] < 2 * 1024**3
+              assert re.fullmatch(r'[0-9a-f]{64}', item['sha256']) and 0 < item['parts'] <= 90
+              signature = read_asset(by_name[item['name'] + '.sig'], 8192).decode().strip()
+              assert signature == item['signature']
+              parts = [by_name[f'{platform}.part-{i:03d}'] for i in range(item['parts'])]
+              assert sum(a['size'] for a in parts) == item['size']
+              all_parts.extend(parts)
+              def download(asset):
+                  path = pathlib.Path('parts') / asset['name']
+                  request = urllib.request.Request(asset['url'], headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/octet-stream'})
+                  digest = hashlib.sha256()
+                  written = 0
+                  with opener.open(request, timeout=120) as response, path.open('wb') as target:
+                      while chunk := response.read(4 * 1024 * 1024):
+                          written += len(chunk)
+                          assert written <= asset['size']
+                          digest.update(chunk)
+                          target.write(chunk)
+                  assert written == asset['size'] and 'sha256:' + digest.hexdigest() == asset['digest']
+              with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                  list(executor.map(download, parts))
+              output = pathlib.Path(item['name'])
+              digest = hashlib.sha256()
+              with output.open('wb') as target:
+                  for asset in parts:
+                      with (pathlib.Path('parts') / asset['name']).open('rb') as source:
+                          while chunk := source.read(4 * 1024 * 1024):
+                              digest.update(chunk)
+                              target.write(chunk)
+              assert output.stat().st_size == item['size'] and digest.hexdigest() == item['sha256']
+              subprocess.run(['gh', 'release', 'upload', 'v' + version, str(output), '--repo', repo], check=True)
+          stored = {a['name']: a for a in api(f'/releases/{release_id}/assets?per_page=100')}
+          manifest = {'version': version, 'notes': plan['notes'], 'pub_date': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'platforms': {}, 'installers': {}}
+          for platform, item in plan['packages'].items():
+              asset = stored[item['name']]
+              assert asset['state'] == 'uploaded' and asset['size'] == item['size'] and asset['digest'] == 'sha256:' + item['sha256']
+              target = 'windows-x86_64' if platform == 'windows-x64' else 'darwin-aarch64'
+              manifest['platforms'][target] = {'url': asset['url'], 'signature': item['signature']}
+              manifest['installers'][target] = {'url': asset['url'], 'name': item['name'], 'sha256': item['sha256']}
+          pathlib.Path('latest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+          pathlib.Path('SHA256SUMS').write_text(''.join(item['sha256'] + '  ' + item['name'] + '\n' for item in plan['packages'].values()))
+          subprocess.run(['gh', 'release', 'upload', 'v' + version, 'latest.json', 'SHA256SUMS', '--repo', repo], check=True)
+          for asset in all_parts + [plan_asset]:
+              api('/releases/assets/' + str(asset['id']), 'DELETE')
+          remaining = api(f'/releases/{release_id}/assets?per_page=100')
+          expected = {'latest.json', 'SHA256SUMS', 'INSTALLATION.txt'}
+          for item in plan['packages'].values():
+              expected |= {item['name'], item['name'] + '.sig'}
+          assert {a['name'] for a in remaining} == expected
+          print('Both signed packages and latest.json are ready in the draft:', release['html_url'])
+          print('Publish only after installed-version update acceptance passes.')
+          PY
