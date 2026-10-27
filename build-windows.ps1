@@ -10,6 +10,7 @@ function Refresh-ProcessPath {
     $env:PATH = ($extra + @([Environment]::GetEnvironmentVariable('Path', 'Machine'), [Environment]::GetEnvironmentVariable('Path', 'User'), $env:PATH)) -join ';'
 }
 function Run-Native([string]$Command, [string[]]$Arguments) {
+    Write-Host ("Running: " + $Command + ' ' + ($Arguments -join ' '))
     & $Command @Arguments
     if ($LASTEXITCODE -ne 0) { throw "$Command failed with exit code $LASTEXITCODE. The build was stopped." }
 }
@@ -50,7 +51,7 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Python 3.12 is unavailable. Open a new PowerShell window and retry.' }
     }
     if (!(Get-Command rustup -ErrorAction SilentlyContinue)) { Install-Tool 'Rustlang.Rustup' }
-    Run-Native 'rustup' @('toolchain', 'install', '1.96.0', '--profile', 'minimal', '--component', 'rustfmt,clippy')
+    Run-Native 'rustup' @('toolchain', 'install', '1.96.0', '--profile', 'minimal', '--component', 'rustfmt,clippy', '--no-self-update')
     Run-Native 'rustup' @('target', 'add', 'x86_64-pc-windows-msvc', '--toolchain', '1.96.0')
     $env:RUSTUP_TOOLCHAIN = '1.96.0'
     $env:CARGO_BUILD_JOBS = '2'
@@ -99,6 +100,8 @@ try {
     } finally { Pop-Location }
 } catch {
     Write-Host ''
-    Write-Error $_
+    [Console]::Error.WriteLine($_.Exception.Message)
+    [Console]::Error.WriteLine($_.InvocationInfo.PositionMessage)
+    [Console]::Error.WriteLine($_.ScriptStackTrace)
     exit 1
 }
