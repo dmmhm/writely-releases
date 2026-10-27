@@ -80,6 +80,7 @@ try {
     Run-Native 'gh' @('auth', 'setup-git', '--hostname', 'github.com')
     $commit = & gh api "repos/dmmhm/stats/commits/$branch" --jq '.sha'
     if ($LASTEXITCODE -ne 0 -or $commit -notmatch '^[a-f0-9]{40}$') { throw 'Unable to read the private Writely source commit.' }
+    if (!$env:WRITELY_DOWNLOAD_CACHE) { $env:WRITELY_DOWNLOAD_CACHE = Join-Path $BuildRoot 'downloads' }
     $source = Join-Path $BuildRoot ('source-' + $commit.Substring(0, 12))
     if (!(Test-Path -LiteralPath $source)) {
         $null = New-Item -ItemType Directory -Path $BuildRoot -Force
