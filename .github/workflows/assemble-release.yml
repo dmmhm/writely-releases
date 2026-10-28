@@ -59,12 +59,16 @@ jobs:
           plan = json.loads(plan_raw)
           version = plan['version']
           assert re.fullmatch(r'\d+\.\d+\.\d+', version) and release['tag_name'] == 'v' + version
-          assert set(plan['packages']) == {'windows-x64', 'macos-arm64'}
+          expected_platforms = {'windows-x64', 'macos-arm64'}
+          has_updates = any(k.endswith('-update') for k in plan['packages'])
+          if has_updates: expected_platforms |= {'windows-x64-update', 'macos-arm64-update'}
+          assert set(plan['packages']) == expected_platforms
           by_name = {a['name']: a for a in assets}
           pathlib.Path('parts').mkdir()
           all_parts = []
           for platform, item in plan['packages'].items():
-              expected_name = f'Writely_{version}_windows-x64-setup.exe' if platform == 'windows-x64' else f'Writely_{version}_macos-arm64.app.tar.gz'
+              suffix = '-update' if platform.endswith('-update') else ''
+              expected_name = f'Writely_{version}_windows-x64{suffix}-setup.exe' if platform.startswith('windows-') else f'Writely_{version}_macos-arm64{suffix}.app.tar.gz'
               assert item['name'] == expected_name and 0 < item['size'] < 2 * 1024**3
               assert re.fullmatch(r'[0-9a-f]{64}', item['sha256']) and 0 < item['parts'] <= 90
               signature = read_asset(by_name[item['name'] + '.sig'], 8192).decode().strip()
@@ -98,19 +102,29 @@ jobs:
               subprocess.run(['gh', 'release', 'upload', 'v' + version, str(output), '--repo', repo], check=True)
           stored = {a['name']: a for a in api(f'/releases/{release_id}/assets?per_page=100')}
           manifest = {'version': version, 'notes': plan['notes'], 'pub_date': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'platforms': {}, 'installers': {}}
+          lightweight = {**manifest, 'platforms': {}, 'installers': {}, 'whisperModels': {}}
           for platform, item in plan['packages'].items():
               asset = stored[item['name']]
               assert asset['state'] == 'uploaded' and asset['size'] == item['size'] and asset['digest'] == 'sha256:' + item['sha256']
-              target = 'windows-x86_64' if platform == 'windows-x64' else 'darwin-aarch64'
-              manifest['platforms'][target] = {'url': asset['url'], 'signature': item['signature']}
-              manifest['installers'][target] = {'url': asset['url'], 'name': item['name'], 'sha256': item['sha256']}
+              target = 'windows-x86_64' if platform.startswith('windows-') else 'darwin-aarch64'
+              feed = lightweight if platform.endswith('-update') else manifest
+              feed['platforms'][target] = {'url': asset['url'], 'signature': item['signature']}
+              feed['installers'][target] = {'url': asset['url'], 'name': item['name'], 'sha256': item['sha256']}
+              if platform.endswith('-update'):
+                  assert item.get('models') and item['models'] == plan['packages'][platform.removesuffix('-update')]['models']
+                  feed['whisperModels'][target] = item['models']
+          uploads = ['latest.json', 'SHA256SUMS']
           pathlib.Path('latest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+          if has_updates:
+              pathlib.Path('latest-lite.json').write_text(json.dumps(lightweight, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+              uploads.append('latest-lite.json')
           pathlib.Path('SHA256SUMS').write_text(''.join(item['sha256'] + '  ' + item['name'] + '\n' for item in plan['packages'].values()))
-          subprocess.run(['gh', 'release', 'upload', 'v' + version, 'latest.json', 'SHA256SUMS', '--repo', repo], check=True)
+          subprocess.run(['gh', 'release', 'upload', 'v' + version, *uploads, '--repo', repo], check=True)
           for asset in all_parts + [plan_asset]:
               api('/releases/assets/' + str(asset['id']), 'DELETE')
           remaining = api(f'/releases/{release_id}/assets?per_page=100')
           expected = {'latest.json', 'SHA256SUMS', 'INSTALLATION.txt'}
+          if has_updates: expected.add('latest-lite.json')
           for item in plan['packages'].values():
               expected |= {item['name'], item['name'] + '.sig'}
           assert {a['name'] for a in remaining} == expected
