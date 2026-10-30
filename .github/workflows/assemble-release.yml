@@ -59,9 +59,7 @@ jobs:
           plan = json.loads(plan_raw)
           version = plan['version']
           assert re.fullmatch(r'\d+\.\d+\.\d+', version) and release['tag_name'] == 'v' + version
-          expected_platforms = {'windows-x64', 'macos-arm64'}
-          has_updates = any(k.endswith('-update') for k in plan['packages'])
-          if has_updates: expected_platforms |= {'windows-x64-update', 'macos-arm64-update'}
+          expected_platforms = {'windows-x64', 'macos-arm64', 'windows-x64-update', 'macos-arm64-update'}
           assert set(plan['packages']) == expected_platforms
           by_name = {a['name']: a for a in assets}
           pathlib.Path('parts').mkdir()
@@ -113,18 +111,15 @@ jobs:
               if platform.endswith('-update'):
                   assert item.get('models') and item['models'] == plan['packages'][platform.removesuffix('-update')]['models']
                   feed['whisperModels'][target] = item['models']
-          uploads = ['latest.json', 'SHA256SUMS']
+          uploads = ['latest.json', 'latest-lite.json', 'SHA256SUMS']
           pathlib.Path('latest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-          if has_updates:
-              pathlib.Path('latest-lite.json').write_text(json.dumps(lightweight, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-              uploads.append('latest-lite.json')
+          pathlib.Path('latest-lite.json').write_text(json.dumps(lightweight, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
           pathlib.Path('SHA256SUMS').write_text(''.join(item['sha256'] + '  ' + item['name'] + '\n' for item in plan['packages'].values()))
           subprocess.run(['gh', 'release', 'upload', 'v' + version, *uploads, '--repo', repo], check=True)
           for asset in all_parts + [plan_asset]:
               api('/releases/assets/' + str(asset['id']), 'DELETE')
           remaining = api(f'/releases/{release_id}/assets?per_page=100')
-          expected = {'latest.json', 'SHA256SUMS', 'INSTALLATION.txt'}
-          if has_updates: expected.add('latest-lite.json')
+          expected = {'latest.json', 'latest-lite.json', 'SHA256SUMS', 'INSTALLATION.txt'}
           for item in plan['packages'].values():
               expected |= {item['name'], item['name'] + '.sig'}
           assert {a['name'] for a in remaining} == expected
