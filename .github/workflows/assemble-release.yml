@@ -1,4 +1,4 @@
-name: Assemble signed Writely release
+name: Assemble signed stats release
 on:
   workflow_dispatch:
     inputs:
@@ -66,7 +66,7 @@ jobs:
           all_parts = []
           for platform, item in plan['packages'].items():
               suffix = '-update' if platform.endswith('-update') else ''
-              expected_name = f'Writely_{version}_windows-x64{suffix}-setup.exe' if platform.startswith('windows-') else f'Writely_{version}_macos-arm64{suffix}.app.tar.gz'
+              expected_name = f'stats_{version}_windows-x64{suffix}-setup.exe' if platform.startswith('windows-') else f'stats_{version}_macos-arm64{suffix}.app.tar.gz'
               assert item['name'] == expected_name and 0 < item['size'] < 2 * 1024**3
               assert re.fullmatch(r'[0-9a-f]{64}', item['sha256']) and 0 < item['parts'] <= 90
               signature = read_asset(by_name[item['name'] + '.sig'], 8192).decode().strip()
